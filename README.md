@@ -105,6 +105,52 @@ docker run -p 3000:3000 soccer-scores-api
 - No auth/rate-limiting is implemented on the API itself yet — for a
   public-facing service this would need at minimum basic rate limiting.
 
+## Incident: the deploy that timed out for two different reasons
+
+While wiring up automated deploys through GitHub Actions, I hit two separate
+networking failures back to back — worth writing up because neither one was
+obvious from the error message alone.
+
+**First failure:** the deploy job used a GitHub-hosted runner that SSHed into
+my EC2 instance. It timed out — `dial tcp ***:22: i/o timeout`. My first
+instinct was to check the SSH key I'd stored as a GitHub secret, since the
+job had also thrown a "no key found" error on an earlier run. But even after
+fixing the key, the timeout stayed. That's when it clicked: I'd locked SSH
+down to only accept connections from *my own* IP address when I set up the
+security group. GitHub's hosted runners come from a totally different,
+constantly rotating set of IPs, so my own hardening was blocking my own
+deploy. Rather than open SSH back up to the world (which would've undone the
+whole point of restricting it), I set up a self-hosted GitHub Actions runner
+that lives directly on the EC2 instance. It reaches *out* to GitHub instead
+of GitHub reaching *in* to it, so SSH stayed locked to my IP the entire time.
+
+**Second failure, right after fixing the first:** the deploy step ran fine —
+pulled the repo, rebuilt the image — but then `docker run` failed with
+`iptables: No chain/target/match by that name`. Odd, since the exact same
+`docker run` command had worked perfectly a dozen times earlier in this
+project. The difference was that I'd installed `firewalld` a step earlier
+(as a dependency for setting up fail2ban), and starting it had rewritten the
+system's iptables rules out from under Docker, wiping out the `DOCKER` chain
+Docker relies on to map container ports. A `systemctl restart docker` got
+Docker to rebuild its own chain, but the container *still* wasn't reachable
+afterward — `docker ps` showed it healthy, `docker logs` showed it listening
+on port 3000, and the port mapping looked correct, so the container itself
+clearly wasn't the problem. Running `firewall-cmd --get-active-zones`
+was the moment it actually clicked: only the `docker0` bridge showed up as
+an active zone, meaning firewalld's default `public` zone — the one that
+actually governs incoming traffic from the internet — didn't have port
+3000 (or even 80/443) opened at all. It had been invisibly filtering
+everything the whole time. Once I explicitly opened those ports in both
+the `public` and `docker` zones and reloaded, everything came back —
+confirmed by re-running the exact same `curl` test I'd used earlier, plus
+checking the live HTTPS URL in a browser to make sure the entire chain
+(internet → Nginx → firewalld → container) was intact end to end.
+
+Nothing about either failure was visible from a single command's output —
+both needed comparing what changed between "it worked" and "it broke" (an
+IP restriction I'd set myself; a firewall daemon I'd installed for an
+unrelated reason) to actually find the cause.
+
 ## What this project demonstrates
 
 - **Node.js/JavaScript** — entire app is Express/Node.
